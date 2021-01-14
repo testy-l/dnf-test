@@ -1,0 +1,185 @@
+---
+name: DNF CI
+on: [push, pull_request_target]
+
+jobs:
+  check-permission:
+    name: Check Author Permissions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query author repository permissions
+        uses: octokit/request-action@v2.x
+        id: user_permission
+        with:
+          route: GET /repos/${{ github.repository }}/collaborators/${{ github.event.sender.login }}/permission
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # restrict running of tests to users with admin or write permission for the repository
+      # see https://docs.github.com/en/free-pro-team@latest/rest/reference/repos#get-repository-permissions-for-a-user
+      # store output if user is allowed in allowed_user job output so it has to be checked in downstream job
+      - name: Check if user does have correct permissions
+        if: contains('admin write', fromJson(steps.user_permission.outputs.data).permission)
+        id: check_user_perm
+        run: |
+          echo "User '${{ github.event.sender.login }}' has permission '${{ fromJson(steps.user_permission.outputs.data).permission }}' allowed values: 'admin', 'write'"
+          echo "::set-output name=allowed_user::true"
+
+    outputs:
+      allowed_user: ${{ steps.check_user_perm.outputs.allowed_user }}
+
+  integration-tests:
+    name: Integration Tests
+    needs: check-permission
+    if: needs.check-permission.outputs.allowed_user == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+    steps:
+      - name: Install tools
+        run: |
+          dnf -y install dnf-plugins-core
+          dnf -y copr enable rpmsoftwaremanagement/rpm-gitoverlay
+          dnf -y install docker git parallel rpm-gitoverlay wget
+
+      - name: Check out ci-dnf-stack
+        uses: actions/checkout@v2
+        with:
+          repository: lukash/ci-dnf-stack
+          ref: gha-ci
+
+      - name: Check out sources
+        uses: actions/checkout@v2
+        with:
+          path: gits/dnf
+          # otherwise we are testing target branch instead of the PR branch (see pull_request_target trigger)
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Rebase to current master
+        run: |
+          pushd gits/dnf
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          echo "remotes:"
+          git remote -v
+          echo "branches:"
+          git branch -v
+          git log --oneline -1 origin/master
+          git rebase origin/master
+          popd
+
+      - name: Install API token for Copr
+        id: copr_token
+        env:
+          COPR_API_TOKEN: ${{secrets.COPR_API_TOKEN}}  # use env to hide the secret
+          # Abusing secrets for a simple env variable; anyone can use this to
+          # run the workflow in their own Copr (for testing etc.) by setting
+          # the user in their project Secrets. It also prevents the workflow
+          # from running on forks. Github hides the secret, the value for
+          # rpm-software-management is "rpmsoftwaremanagement #".  See the hack
+          # below for why the hash sign.
+          COPR_USER: ${{secrets.COPR_USER}}
+        if: env.COPR_USER != ''
+        run: |
+          mkdir -p "$HOME/.config"
+          echo "$COPR_API_TOKEN" > "$HOME/.config/copr"
+
+      - name: Create string
+        run: |
+          RPMS=$(cat << EOF
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//python3-librepo-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//python3-librepo-debuginfo-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//librepo-devel-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//librepo-debuginfo-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//librepo-debugsource-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921024-librepo//librepo-1.12.2-0.29ga0752e3.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//libcomps-devel-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//python3-libcomps-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//libcomps-doc-0.1.15-7g16b3f64.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//python3-libcomps-debuginfo-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//libcomps-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//python-libcomps-doc-0.1.15-7g16b3f64.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//libcomps-debuginfo-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921025-libcomps//libcomps-debugsource-0.1.15-7g16b3f64.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//libdnf-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//python3-libdnf-debuginfo-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//libdnf-devel-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//libdnf-debuginfo-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//libdnf-debugsource-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//python3-hawkey-debuginfo-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//python3-hawkey-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921026-libdnf//python3-libdnf-0.58.0-2g27ac9873.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921027-dnf//yum-4.6.0-1.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921027-dnf//python3-dnf-4.6.0-1.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921027-dnf//dnf-automatic-4.6.0-1.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921027-dnf//dnf-4.6.0-1.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921027-dnf//dnf-data-4.6.0-1.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921028-microdnf//microdnf-debugsource-3.6.0-16g07ac55e.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921028-microdnf//microdnf-debuginfo-3.6.0-16g07ac55e.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921028-microdnf//microdnf-3.6.0-16g07ac55e.fc32.x86_64.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugin-post-transaction-actions-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugins-core-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugin-versionlock-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//dnf-plugins-core-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugin-local-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//dnf-utils-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugin-show-leaves-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921029-dnf-plugins-core//python3-dnf-plugin-leaves-4.0.19-1g247926c.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-torproxy-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugins-extras-common-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-snapper-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-kickstart-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-showvars-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-tracer-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-rpmconf-4.0.13-6g7d97200.fc32.noarch.rpm
+          https://download.copr.fedorainfracloud.org/results/lhrazky/rpm-gitoverlay-1611930588.788920/fedora-32-x86_64/01921031-dnf-plugins-extras//python3-dnf-plugin-system-upgrade-4.0.13-6g7d97200.fc32.noarch.rpm
+          EOF
+          )
+          echo "RPMS<<EOF" >> $GITHUB_ENV
+          echo "$RPMS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Build in Copr
+        if: steps.copr_token.conclusion == 'success'
+        env:
+          COPR_USER: ${{secrets.COPR_USER}}
+        run: |
+          # hack: Github replaces secrets with *** in the whole output (even in
+          # e.g. Copr URLs printed by rpm-gitoverlay). If there's a comment (#)
+          # at the end of the secret (e.g.  "rpmsofwaremanagement #"), this
+          # will clean it up and since it is no longer the whole secret being
+          # printed, Github won't hide it anymore.
+          COPR_USER=${{secrets.COPR_USER}}
+
+          echo "${{env.RPMS}}" > rpmlist
+          #rm rpmlist
+
+          # if there's a git already checked out in the `gits` directory, rpm-gitoverlay will use it
+          #rpm-gitoverlay -o rpmlist --gitdir=gits build-overlay -s overlays/dnf-ci rpm copr --owner $COPR_USER --chroot fedora-32-x86_64
+          #cat rpmlist
+          #echo "LS:"
+          #ls
+          #echo "---"
+          #ls gits
+          #echo "==="
+          #ls ..
+          #echo "rpms"
+          #ls rpms
+          #echo "GITTT"
+          #pushd gits
+          #pushd dnf
+          #git status
+          #popd
+          #popd
+          for RPM in $(cat rpmlist); do wget -P rpms $RPM; done
+
+      - name: Run tests
+        run: |
+          CONTAINER=$(uuidgen)
+          #./dnf-testing.sh -c $CONTAINER build jjb
+
+          #TESTS=($(./dnf-testing.sh -c $CONTAINER list))
+          #mkdir "test-results"
+          #TEST_DIR=`readlink -f "test-results"`
+          #parallel -j2 ./dnf-testing.sh --container "$CONTAINER" run --junit-directory "$TEST_DIR" --noxfail "{}" ::: "${TESTS[@]}"
