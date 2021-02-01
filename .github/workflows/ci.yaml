@@ -33,7 +33,7 @@ jobs:
     needs: check-permission
     if: needs.check-permission.outputs.allowed_user == 'true'
     runs-on: ubuntu-latest
-    container:
+    container: 
       image: fedora:latest
     steps:
       - name: Install tools
